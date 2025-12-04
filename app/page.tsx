@@ -5,58 +5,54 @@ import LoadingScreen from '@/components/LoadingScreen';
 import WaitingRoom from '@/components/WaitingRoom';
 import GameTable from '@/components/GameTable';
 import { useMultiplayer } from '@/hooks/useMultiplayer';
-import { GameRoom, GameState } from '@/lib/supabase';
+import { GameRoom, ChallengeRequest, OnlinePlayer } from '@/lib/supabase';
 
 type GameMode = 'practice' | 'multiplayer';
 
 export default function Home() {
   const [screenState, setScreenState] = useState<'loading' | 'waiting' | 'playing'>('loading');
   const [gameMode, setGameMode] = useState<GameMode>('practice');
-  const [opponentFound, setOpponentFound] = useState(false);
 
-  const handleMatchFound = useCallback((room: GameRoom, isPlayer1: boolean) => {
-    console.log('Match found!', room, 'Is Player 1:', isPlayer1);
-    setOpponentFound(true);
-    // Start game after a brief delay to show "Match Found" message
-    setTimeout(() => {
-      setGameMode('multiplayer');
-      setScreenState('playing');
-    }, 2000);
+  const handleChallengeReceived = useCallback((challenge: ChallengeRequest) => {
+    console.log('Challenge received from:', challenge.challenger_nickname);
   }, []);
 
-  const handleOpponentJoined = useCallback((room: GameRoom) => {
-    console.log('Opponent joined!', room);
-    setOpponentFound(true);
-    setTimeout(() => {
-      setGameMode('multiplayer');
-      setScreenState('playing');
-    }, 2000);
+  const handleChallengeAccepted = useCallback((room: GameRoom, isP1: boolean) => {
+    console.log('Challenge accepted! Room:', room.id, 'Is Player 1:', isP1);
+    setGameMode('multiplayer');
+    setScreenState('playing');
   }, []);
 
-  const handleGameStateUpdate = useCallback((state: GameState) => {
-    // This will be used by GameTable component for real-time sync
-    console.log('Game state update:', state);
+  const handleChallengeDeclined = useCallback((challenge: ChallengeRequest) => {
+    console.log('Challenge declined by:', challenge.challenged_nickname);
+    alert(`${challenge.challenged_nickname} declined your challenge.`);
   }, []);
 
   const handleOpponentLeft = useCallback(() => {
     console.log('Opponent left!');
+    alert('Opponent left the game.');
     setScreenState('waiting');
-    setOpponentFound(false);
   }, []);
 
   const {
-    isSearching,
+    nickname,
+    isOnline,
+    onlinePlayers,
+    pendingChallenge,
+    sentChallenge,
     currentRoom,
     isPlayer1,
-    findMatch,
-    cancelSearch,
+    goOnline,
+    sendChallenge,
+    acceptChallenge,
+    declineChallenge,
+    cancelChallenge,
     leaveGame,
-    updateGameState,
-    updateScore,
+    refreshPlayers,
   } = useMultiplayer({
-    onMatchFound: handleMatchFound,
-    onOpponentJoined: handleOpponentJoined,
-    onGameStateUpdate: handleGameStateUpdate,
+    onChallengeReceived: handleChallengeReceived,
+    onChallengeAccepted: handleChallengeAccepted,
+    onChallengeDeclined: handleChallengeDeclined,
     onOpponentLeft: handleOpponentLeft,
   });
 
@@ -64,7 +60,7 @@ export default function Home() {
     // Simulate loading assets
     const timer = setTimeout(() => {
       setScreenState('waiting');
-    }, 3000);
+    }, 2000);
     return () => clearTimeout(timer);
   }, []);
 
@@ -78,7 +74,18 @@ export default function Home() {
       await leaveGame();
     }
     setScreenState('waiting');
-    setOpponentFound(false);
+  };
+
+  const handleSendChallenge = async (player: OnlinePlayer) => {
+    await sendChallenge(player);
+  };
+
+  const handleAcceptChallenge = async (challenge: ChallengeRequest) => {
+    await acceptChallenge(challenge);
+  };
+
+  const handleDeclineChallenge = async (challenge: ChallengeRequest) => {
+    await declineChallenge(challenge);
   };
 
   return (
@@ -87,10 +94,17 @@ export default function Home() {
       {screenState === 'waiting' && (
         <WaitingRoom 
           onStart={startPractice}
-          onFindMatch={findMatch}
-          onCancelSearch={cancelSearch}
-          isSearching={isSearching}
-          opponentFound={opponentFound}
+          nickname={nickname}
+          isOnline={isOnline}
+          onlinePlayers={onlinePlayers}
+          pendingChallenge={pendingChallenge}
+          sentChallenge={sentChallenge}
+          onGoOnline={goOnline}
+          onSendChallenge={handleSendChallenge}
+          onAcceptChallenge={handleAcceptChallenge}
+          onDeclineChallenge={handleDeclineChallenge}
+          onCancelChallenge={cancelChallenge}
+          onRefreshPlayers={refreshPlayers}
         />
       )}
       {screenState === 'playing' && (
@@ -99,8 +113,6 @@ export default function Home() {
           isMultiplayer={gameMode === 'multiplayer'}
           isPlayer1={isPlayer1}
           currentRoom={currentRoom}
-          updateGameState={updateGameState}
-          updateScore={updateScore}
         />
       )}
     </main>

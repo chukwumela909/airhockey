@@ -1,16 +1,15 @@
 'use client';
 
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useSound } from '@/hooks/useSound';
-import { GameRoom, GameState } from '@/lib/supabase';
+import { supabase, GameRoom } from '@/lib/supabase';
+import { RealtimeChannel } from '@supabase/supabase-js';
 
 interface GameTableProps {
   onEndGame: () => void;
   isMultiplayer?: boolean;
   isPlayer1?: boolean;
   currentRoom?: GameRoom | null;
-  updateGameState?: (state: Partial<GameState>) => Promise<void>;
-  updateScore?: (player1Score: number, player2Score: number) => Promise<void>;
 }
 
 export default function GameTable({ 
@@ -18,19 +17,35 @@ export default function GameTable({
   isMultiplayer = false,
   isPlayer1 = true,
   currentRoom,
-  updateGameState,
-  updateScore,
 }: GameTableProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [score, setScore] = useState({ player: 0, opponent: 0 });
+  const [score, setScore] = useState({ player1: 0, player2: 0 });
   const { playWallHit, playPaddleHit, playGoal, playPuckDrop } = useSound();
   
   // Game constants
   const TABLE_WIDTH = 400;
-  const TABLE_HEIGHT = 700; // Mobile portrait aspect ratio
+  const TABLE_HEIGHT = 700;
   const PUCK_RADIUS = 15;
   const PADDLE_RADIUS = 25;
   const GOAL_SIZE = 120;
+
+  // Refs to hold mutable game state
+  const gameStateRef = useRef({
+    puck: { x: TABLE_WIDTH / 2, y: TABLE_HEIGHT / 2, vx: 0, vy: 0 },
+    player1: { x: TABLE_WIDTH / 2, y: TABLE_HEIGHT - 100 }, // Bottom (blue)
+    player2: { x: TABLE_WIDTH / 2, y: 100 }, // Top (pink)
+    myPaddle: { x: TABLE_WIDTH / 2, y: isPlayer1 ? TABLE_HEIGHT - 100 : 100 },
+    opponentPaddle: { x: TABLE_WIDTH / 2, y: isPlayer1 ? 100 : TABLE_HEIGHT - 100 },
+    score: { player1: 0, player2: 0 },
+  });
+
+  const channelRef = useRef<RealtimeChannel | null>(null);
+  const lastSentRef = useRef<number>(0);
+  const isPlayer1Ref = useRef(isPlayer1);
+
+  useEffect(() => {
+    isPlayer1Ref.current = isPlayer1;
+  }, [isPlayer1]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -39,11 +54,63 @@ export default function GameTable({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
+    const gameState = gameStateRef.current;
+
+    // Setup Supabase Realtime for multiplayer
+    if (isMultiplayer && currentRoom) {
+      console.log('Setting up realtime channel for room:', currentRoom.id, 'isPlayer1:', isPlayer1);
+      
+      channelRef.current = supabase.channel(`game_${currentRoom.id}`, {
+        config: {
+          broadcast: { self: false },
+        },
+      });
+
+      // Listen for opponent paddle movements
+      channelRef.current.on('broadcast', { event: 'paddle_move' }, (payload) => {
+        const { x, y, playerId } = payload.payload;
+        console.log('Received paddle move:', { x, y, playerId, myPlayer1: isPlayer1Ref.current });
+        // Only update if it's from opponent
+        const isFromPlayer1 = playerId === currentRoom.player1_id;
+        if ((isPlayer1Ref.current && !isFromPlayer1) || (!isPlayer1Ref.current && isFromPlayer1)) {
+          gameState.opponentPaddle.x = x;
+          gameState.opponentPaddle.y = y;
+        }
+      });
+
+      // Listen for puck updates (Player 1 is authoritative for puck)
+      channelRef.current.on('broadcast', { event: 'puck_update' }, (payload) => {
+        if (!isPlayer1Ref.current) {
+          // Player 2 receives puck state from Player 1
+          const { x, y, vx, vy } = payload.payload;
+          gameState.puck.x = x;
+          gameState.puck.y = y;
+          gameState.puck.vx = vx;
+          gameState.puck.vy = vy;
+        }
+      });
+
+      // Listen for score updates
+      channelRef.current.on('broadcast', { event: 'score_update' }, (payload) => {
+        gameState.score = payload.payload;
+        setScore(payload.payload);
+      });
+
+      // Listen for sound effects
+      channelRef.current.on('broadcast', { event: 'sound' }, (payload) => {
+        const { type } = payload.payload;
+        if (type === 'wall') playWallHit();
+        if (type === 'paddle') playPaddleHit();
+        if (type === 'goal') playGoal();
+      });
+
+      channelRef.current.subscribe();
+    }
+
     // Handle resizing
     const resize = () => {
       const container = canvas.parentElement;
       if (container) {
-        // Maintain aspect ratio
         const scale = Math.min(
           container.clientWidth / TABLE_WIDTH,
           container.clientHeight / TABLE_HEIGHT
@@ -56,21 +123,15 @@ export default function GameTable({
     window.addEventListener('resize', resize);
     resize();
 
-    // Game State
-    let puck = { x: TABLE_WIDTH / 2, y: TABLE_HEIGHT / 2, vx: 0, vy: 0 };
-    let player = { x: TABLE_WIDTH / 2, y: TABLE_HEIGHT - 100 };
-    let opponent = { x: TABLE_WIDTH / 2, y: 100, vx: 0, vy: 0 }; // Simple AI
-    
     let isDragging = false;
 
-    // Particle system for glitter effects
+    // Particle system
     interface Particle {
       x: number;
       y: number;
       vx: number;
       vy: number;
       life: number;
-      maxLife: number;
       color: string;
       size: number;
     }
@@ -81,12 +142,10 @@ export default function GameTable({
         const angle = Math.random() * Math.PI * 2;
         const speed = Math.random() * 5 + 2;
         particles.push({
-          x,
-          y,
+          x, y,
           vx: Math.cos(angle) * speed,
           vy: Math.sin(angle) * speed,
           life: 1,
-          maxLife: 1,
           color,
           size: Math.random() * 4 + 2,
         });
@@ -122,6 +181,62 @@ export default function GameTable({
       });
     };
 
+    // Broadcast paddle position
+    const broadcastPaddle = (x: number, y: number) => {
+      if (!isMultiplayer || !currentRoom || !channelRef.current) return;
+      
+      const now = Date.now();
+      if (now - lastSentRef.current < 16) return; // Throttle to ~60fps
+      lastSentRef.current = now;
+
+      channelRef.current.send({
+        type: 'broadcast',
+        event: 'paddle_move',
+        payload: {
+          x, y,
+          playerId: isPlayer1Ref.current ? currentRoom.player1_id : currentRoom.player2_id,
+        },
+      });
+    };
+
+    // Broadcast puck state (only Player 1)
+    const broadcastPuck = () => {
+      if (!isMultiplayer || !isPlayer1Ref.current || !currentRoom || !channelRef.current) return;
+      
+      channelRef.current.send({
+        type: 'broadcast',
+        event: 'puck_update',
+        payload: {
+          x: gameState.puck.x,
+          y: gameState.puck.y,
+          vx: gameState.puck.vx,
+          vy: gameState.puck.vy,
+        },
+      });
+    };
+
+    // Broadcast score
+    const broadcastScore = (newScore: { player1: number; player2: number }) => {
+      if (!isMultiplayer || !channelRef.current) return;
+      
+      channelRef.current.send({
+        type: 'broadcast',
+        event: 'score_update',
+        payload: newScore,
+      });
+    };
+
+    // Broadcast sound
+    const broadcastSound = (type: string) => {
+      if (!isMultiplayer || !channelRef.current) return;
+      
+      channelRef.current.send({
+        type: 'broadcast',
+        event: 'sound',
+        payload: { type },
+      });
+    };
+
     // Input handling
     const handleStart = (e: MouseEvent | TouchEvent) => {
       isDragging = true;
@@ -151,9 +266,26 @@ export default function GameTable({
       const x = (clientX - rect.left) * scaleX;
       const y = (clientY - rect.top) * scaleY;
 
-      // Constrain player to bottom half
-      player.x = Math.max(PADDLE_RADIUS, Math.min(TABLE_WIDTH - PADDLE_RADIUS, x));
-      player.y = Math.max(TABLE_HEIGHT / 2 + PADDLE_RADIUS, Math.min(TABLE_HEIGHT - PADDLE_RADIUS, y));
+      // Constrain to own half
+      const constrainedX = Math.max(PADDLE_RADIUS, Math.min(TABLE_WIDTH - PADDLE_RADIUS, x));
+      let constrainedY: number;
+      
+      if (isPlayer1Ref.current) {
+        // Player 1 controls bottom half
+        constrainedY = Math.max(TABLE_HEIGHT / 2 + PADDLE_RADIUS, Math.min(TABLE_HEIGHT - PADDLE_RADIUS, y));
+        gameState.player1.x = constrainedX;
+        gameState.player1.y = constrainedY;
+      } else {
+        // Player 2 controls top half
+        constrainedY = Math.max(PADDLE_RADIUS, Math.min(TABLE_HEIGHT / 2 - PADDLE_RADIUS, y));
+        gameState.player2.x = constrainedX;
+        gameState.player2.y = constrainedY;
+      }
+
+      gameState.myPaddle.x = constrainedX;
+      gameState.myPaddle.y = constrainedY;
+      
+      broadcastPaddle(constrainedX, constrainedY);
     };
 
     canvas.addEventListener('mousedown', handleStart);
@@ -163,134 +295,170 @@ export default function GameTable({
     canvas.addEventListener('touchmove', handleMove, { passive: false });
     canvas.addEventListener('touchend', handleEnd);
 
+    // Reset puck
+    const resetPuck = () => {
+      gameState.puck = { x: TABLE_WIDTH / 2, y: TABLE_HEIGHT / 2, vx: 0, vy: 0 };
+      playPuckDrop();
+    };
+
     // Game Loop
     let animationFrameId: number;
 
     const update = () => {
-      // Physics Logic
-      
-      // Puck movement
-      puck.x += puck.vx;
-      puck.y += puck.vy;
+      // In multiplayer, only Player 1 calculates physics
+      if (!isMultiplayer || isPlayer1Ref.current) {
+        // Puck movement
+        gameState.puck.x += gameState.puck.vx;
+        gameState.puck.y += gameState.puck.vy;
 
-      // Friction
-      puck.vx *= 0.99;
-      puck.vy *= 0.99;
+        // Friction
+        gameState.puck.vx *= 0.99;
+        gameState.puck.vy *= 0.99;
 
-      // Wall collisions
-      if (puck.x - PUCK_RADIUS < 0) {
-        puck.x = PUCK_RADIUS;
-        puck.vx *= -1;
-        playWallHit();
-        spawnParticles(puck.x, puck.y, '#00fff5', 10);
-      }
-      if (puck.x + PUCK_RADIUS > TABLE_WIDTH) {
-        puck.x = TABLE_WIDTH - PUCK_RADIUS;
-        puck.vx *= -1;
-        playWallHit();
-        spawnParticles(puck.x, puck.y, '#00fff5', 10);
-      }
-      if (puck.y - PUCK_RADIUS < 0) {
-        // Goal check (Top)
-        if (puck.x > (TABLE_WIDTH - GOAL_SIZE) / 2 && puck.x < (TABLE_WIDTH + GOAL_SIZE) / 2) {
-          setScore(s => ({ ...s, player: s.player + 1 }));
-          playGoal();
-          spawnParticles(puck.x, puck.y, '#FFD700', 30); // Gold particles for goal
-          resetPuck();
-        } else {
-          puck.y = PUCK_RADIUS;
-          puck.vy *= -1;
+        // Wall collisions
+        if (gameState.puck.x - PUCK_RADIUS < 0) {
+          gameState.puck.x = PUCK_RADIUS;
+          gameState.puck.vx *= -1;
           playWallHit();
-          spawnParticles(puck.x, puck.y, '#00fff5', 10);
+          broadcastSound('wall');
+          spawnParticles(gameState.puck.x, gameState.puck.y, '#00fff5', 10);
         }
-      }
-      if (puck.y + PUCK_RADIUS > TABLE_HEIGHT) {
-        // Goal check (Bottom)
-        if (puck.x > (TABLE_WIDTH - GOAL_SIZE) / 2 && puck.x < (TABLE_WIDTH + GOAL_SIZE) / 2) {
-          setScore(s => ({ ...s, opponent: s.opponent + 1 }));
-          playGoal();
-          spawnParticles(puck.x, puck.y, '#FFD700', 30); // Gold particles for goal
-          resetPuck();
-        } else {
-          puck.y = TABLE_HEIGHT - PUCK_RADIUS;
-          puck.vy *= -1;
+        if (gameState.puck.x + PUCK_RADIUS > TABLE_WIDTH) {
+          gameState.puck.x = TABLE_WIDTH - PUCK_RADIUS;
+          gameState.puck.vx *= -1;
           playWallHit();
-          spawnParticles(puck.x, puck.y, '#00fff5', 10);
+          broadcastSound('wall');
+          spawnParticles(gameState.puck.x, gameState.puck.y, '#00fff5', 10);
         }
-      }
+        
+        // Top wall / goal
+        if (gameState.puck.y - PUCK_RADIUS < 0) {
+          if (gameState.puck.x > (TABLE_WIDTH - GOAL_SIZE) / 2 && gameState.puck.x < (TABLE_WIDTH + GOAL_SIZE) / 2) {
+            // Goal for Player 1!
+            const newScore = { player1: gameState.score.player1 + 1, player2: gameState.score.player2 };
+            gameState.score = newScore;
+            setScore(newScore);
+            broadcastScore(newScore);
+            playGoal();
+            broadcastSound('goal');
+            spawnParticles(gameState.puck.x, gameState.puck.y, '#FFD700', 30);
+            resetPuck();
+          } else {
+            gameState.puck.y = PUCK_RADIUS;
+            gameState.puck.vy *= -1;
+            playWallHit();
+            broadcastSound('wall');
+            spawnParticles(gameState.puck.x, gameState.puck.y, '#00fff5', 10);
+          }
+        }
+        
+        // Bottom wall / goal
+        if (gameState.puck.y + PUCK_RADIUS > TABLE_HEIGHT) {
+          if (gameState.puck.x > (TABLE_WIDTH - GOAL_SIZE) / 2 && gameState.puck.x < (TABLE_WIDTH + GOAL_SIZE) / 2) {
+            // Goal for Player 2!
+            const newScore = { player1: gameState.score.player1, player2: gameState.score.player2 + 1 };
+            gameState.score = newScore;
+            setScore(newScore);
+            broadcastScore(newScore);
+            playGoal();
+            broadcastSound('goal');
+            spawnParticles(gameState.puck.x, gameState.puck.y, '#FFD700', 30);
+            resetPuck();
+          } else {
+            gameState.puck.y = TABLE_HEIGHT - PUCK_RADIUS;
+            gameState.puck.vy *= -1;
+            playWallHit();
+            broadcastSound('wall');
+            spawnParticles(gameState.puck.x, gameState.puck.y, '#00fff5', 10);
+          }
+        }
 
-      // Paddle collisions (Player)
-      const dx = puck.x - player.x;
-      const dy = puck.y - player.y;
-      const dist = Math.sqrt(dx * dx + dy * dy);
-      if (dist < PUCK_RADIUS + PADDLE_RADIUS) {
-        const angle = Math.atan2(dy, dx);
-        const speed = Math.sqrt(puck.vx * puck.vx + puck.vy * puck.vy);
-        const push = 15; // Force
+        // Get paddle positions for collision
+        let p1 = gameState.player1;
+        let p2 = gameState.player2;
         
-        puck.vx = Math.cos(angle) * (speed + push * 0.5);
-        puck.vy = Math.sin(angle) * (speed + push * 0.5);
-        
-        // Prevent sticking
-        const overlap = (PUCK_RADIUS + PADDLE_RADIUS) - dist;
-        puck.x += Math.cos(angle) * overlap;
-        puck.y += Math.sin(angle) * overlap;
-        
-        playPaddleHit();
-        spawnParticles(puck.x, puck.y, '#00fff5', 20); // Cyan for player
-      }
+        if (isMultiplayer) {
+          if (isPlayer1Ref.current) {
+            p1 = gameState.myPaddle;
+            p2 = gameState.opponentPaddle;
+          } else {
+            p1 = gameState.opponentPaddle;
+            p2 = gameState.myPaddle;
+          }
+        }
 
-      // AI Movement (Simple tracking)
-      const targetX = puck.x;
-      const targetY = Math.min(TABLE_HEIGHT / 2 - 50, Math.max(50, puck.y)); // Stay in top half
-      
-      opponent.x += (targetX - opponent.x) * 0.05;
-      // Only move Y if puck is in opponent's half
-      if (puck.y < TABLE_HEIGHT / 2) {
-          opponent.y += (puck.y - opponent.y) * 0.05;
-      } else {
-          opponent.y += (100 - opponent.y) * 0.05; // Return to defense
-      }
+        // Player 1 paddle collision (bottom)
+        const dx1 = gameState.puck.x - p1.x;
+        const dy1 = gameState.puck.y - p1.y;
+        const dist1 = Math.sqrt(dx1 * dx1 + dy1 * dy1);
+        if (dist1 < PUCK_RADIUS + PADDLE_RADIUS) {
+          const angle = Math.atan2(dy1, dx1);
+          const speed = Math.sqrt(gameState.puck.vx * gameState.puck.vx + gameState.puck.vy * gameState.puck.vy);
+          const push = 15;
+          
+          gameState.puck.vx = Math.cos(angle) * (speed + push * 0.5);
+          gameState.puck.vy = Math.sin(angle) * (speed + push * 0.5);
+          
+          const overlap = (PUCK_RADIUS + PADDLE_RADIUS) - dist1;
+          gameState.puck.x += Math.cos(angle) * overlap;
+          gameState.puck.y += Math.sin(angle) * overlap;
+          
+          playPaddleHit();
+          broadcastSound('paddle');
+          spawnParticles(gameState.puck.x, gameState.puck.y, '#00fff5', 20);
+        }
 
-      // Paddle collisions (Opponent)
-      const odx = puck.x - opponent.x;
-      const ody = puck.y - opponent.y;
-      const odist = Math.sqrt(odx * odx + ody * ody);
-      if (odist < PUCK_RADIUS + PADDLE_RADIUS) {
-        const angle = Math.atan2(ody, odx);
-        const speed = Math.sqrt(puck.vx * puck.vx + puck.vy * puck.vy);
-        const push = 10;
-        
-        puck.vx = Math.cos(angle) * (speed + push * 0.5);
-        puck.vy = Math.sin(angle) * (speed + push * 0.5);
-        
-        const overlap = (PUCK_RADIUS + PADDLE_RADIUS) - odist;
-        puck.x += Math.cos(angle) * overlap;
-        puck.y += Math.sin(angle) * overlap;
-        
-        playPaddleHit();
-        spawnParticles(puck.x, puck.y, '#ff007f', 20); // Pink for opponent
+        // Player 2 paddle collision (top)
+        const dx2 = gameState.puck.x - p2.x;
+        const dy2 = gameState.puck.y - p2.y;
+        const dist2 = Math.sqrt(dx2 * dx2 + dy2 * dy2);
+        if (dist2 < PUCK_RADIUS + PADDLE_RADIUS) {
+          const angle = Math.atan2(dy2, dx2);
+          const speed = Math.sqrt(gameState.puck.vx * gameState.puck.vx + gameState.puck.vy * gameState.puck.vy);
+          const push = 15;
+          
+          gameState.puck.vx = Math.cos(angle) * (speed + push * 0.5);
+          gameState.puck.vy = Math.sin(angle) * (speed + push * 0.5);
+          
+          const overlap = (PUCK_RADIUS + PADDLE_RADIUS) - dist2;
+          gameState.puck.x += Math.cos(angle) * overlap;
+          gameState.puck.y += Math.sin(angle) * overlap;
+          
+          playPaddleHit();
+          broadcastSound('paddle');
+          spawnParticles(gameState.puck.x, gameState.puck.y, '#ff007f', 20);
+        }
+
+        // Broadcast puck state
+        broadcastPuck();
+
+        // AI for practice mode
+        if (!isMultiplayer) {
+          const targetX = gameState.puck.x;
+          gameState.player2.x += (targetX - gameState.player2.x) * 0.05;
+          if (gameState.puck.y < TABLE_HEIGHT / 2) {
+            gameState.player2.y += (gameState.puck.y - gameState.player2.y) * 0.05;
+          } else {
+            gameState.player2.y += (100 - gameState.player2.y) * 0.05;
+          }
+        }
       }
 
       // Update particles
       updateParticles();
 
+      // Draw
       draw();
       animationFrameId = requestAnimationFrame(update);
     };
 
-    const resetPuck = () => {
-      puck = { x: TABLE_WIDTH / 2, y: TABLE_HEIGHT / 2, vx: 0, vy: 0 };
-      playPuckDrop();
-    };
-
     const draw = () => {
       // Clear
-      ctx.fillStyle = '#1a1a2e'; // var(--color-game-bg)
+      ctx.fillStyle = '#1a1a2e';
       ctx.fillRect(0, 0, TABLE_WIDTH, TABLE_HEIGHT);
 
       // Table markings
-      ctx.strokeStyle = '#0f3460'; // var(--color-game-accent)
+      ctx.strokeStyle = '#0f3460';
       ctx.lineWidth = 5;
       
       // Center line
@@ -304,8 +472,8 @@ export default function GameTable({
       ctx.arc(TABLE_WIDTH / 2, TABLE_HEIGHT / 2, 50, 0, Math.PI * 2);
       ctx.stroke();
 
-      // Goals - styled like the reference image
-      // Top goal (opponent) - yellow/gold glow
+      // Goals
+      // Top goal (Player 2's goal - yellow)
       ctx.beginPath();
       ctx.moveTo((TABLE_WIDTH - GOAL_SIZE) / 2, 0);
       ctx.lineTo((TABLE_WIDTH + GOAL_SIZE) / 2, 0);
@@ -317,7 +485,6 @@ export default function GameTable({
       ctx.shadowBlur = 0;
       ctx.closePath();
       
-      // Top goal arc
       ctx.beginPath();
       ctx.arc(TABLE_WIDTH / 2, 0, GOAL_SIZE / 2, 0, Math.PI, false);
       ctx.strokeStyle = '#555555';
@@ -325,7 +492,7 @@ export default function GameTable({
       ctx.stroke();
       ctx.closePath();
 
-      // Bottom goal (player) - blue glow
+      // Bottom goal (Player 1's goal - blue)
       ctx.beginPath();
       ctx.moveTo((TABLE_WIDTH - GOAL_SIZE) / 2, TABLE_HEIGHT);
       ctx.lineTo((TABLE_WIDTH + GOAL_SIZE) / 2, TABLE_HEIGHT);
@@ -337,7 +504,6 @@ export default function GameTable({
       ctx.shadowBlur = 0;
       ctx.closePath();
       
-      // Bottom goal arc
       ctx.beginPath();
       ctx.arc(TABLE_WIDTH / 2, TABLE_HEIGHT, GOAL_SIZE / 2, Math.PI, 0, false);
       ctx.strokeStyle = '#555555';
@@ -347,17 +513,31 @@ export default function GameTable({
 
       // Puck
       ctx.beginPath();
-      ctx.arc(puck.x, puck.y, PUCK_RADIUS, 0, Math.PI * 2);
-      ctx.fillStyle = '#00fff5'; // var(--color-neon-blue)
+      ctx.arc(gameState.puck.x, gameState.puck.y, PUCK_RADIUS, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff';
       ctx.shadowBlur = 15;
-      ctx.shadowColor = '#00fff5';
+      ctx.shadowColor = '#ffffff';
       ctx.fill();
       ctx.shadowBlur = 0;
       ctx.closePath();
 
-      // Player Paddle (hollow ring style)
+      // Get paddle positions
+      let p1Pos = gameState.player1;
+      let p2Pos = gameState.player2;
+      
+      if (isMultiplayer) {
+        if (isPlayer1Ref.current) {
+          p1Pos = gameState.myPaddle;
+          p2Pos = gameState.opponentPaddle;
+        } else {
+          p1Pos = gameState.opponentPaddle;
+          p2Pos = gameState.myPaddle;
+        }
+      }
+
+      // Player 1 Paddle (Bottom - Blue)
       ctx.beginPath();
-      ctx.arc(player.x, player.y, PADDLE_RADIUS, 0, Math.PI * 2);
+      ctx.arc(p1Pos.x, p1Pos.y, PADDLE_RADIUS, 0, Math.PI * 2);
       ctx.strokeStyle = '#00fff5';
       ctx.lineWidth = 6;
       ctx.shadowBlur = 20;
@@ -366,17 +546,16 @@ export default function GameTable({
       ctx.shadowBlur = 0;
       ctx.closePath();
       
-      // Inner circle for paddle
       ctx.beginPath();
-      ctx.arc(player.x, player.y, PADDLE_RADIUS - 12, 0, Math.PI * 2);
+      ctx.arc(p1Pos.x, p1Pos.y, PADDLE_RADIUS - 12, 0, Math.PI * 2);
       ctx.strokeStyle = '#00fff5';
       ctx.lineWidth = 3;
       ctx.stroke();
       ctx.closePath();
 
-      // Opponent Paddle (hollow ring style)
+      // Player 2 Paddle (Top - Pink)
       ctx.beginPath();
-      ctx.arc(opponent.x, opponent.y, PADDLE_RADIUS, 0, Math.PI * 2);
+      ctx.arc(p2Pos.x, p2Pos.y, PADDLE_RADIUS, 0, Math.PI * 2);
       ctx.strokeStyle = '#ff007f';
       ctx.lineWidth = 6;
       ctx.shadowBlur = 20;
@@ -385,15 +564,14 @@ export default function GameTable({
       ctx.shadowBlur = 0;
       ctx.closePath();
       
-      // Inner circle for opponent paddle
       ctx.beginPath();
-      ctx.arc(opponent.x, opponent.y, PADDLE_RADIUS - 12, 0, Math.PI * 2);
+      ctx.arc(p2Pos.x, p2Pos.y, PADDLE_RADIUS - 12, 0, Math.PI * 2);
       ctx.strokeStyle = '#ff007f';
       ctx.lineWidth = 3;
       ctx.stroke();
       ctx.closePath();
 
-      // Draw particles on top
+      // Draw particles
       drawParticles();
     };
 
@@ -408,18 +586,29 @@ export default function GameTable({
       canvas.removeEventListener('touchmove', handleMove);
       canvas.removeEventListener('touchend', handleEnd);
       cancelAnimationFrame(animationFrameId);
+      channelRef.current?.unsubscribe();
     };
-  }, [playWallHit, playPaddleHit, playGoal, playPuckDrop]);
+  }, [isMultiplayer, currentRoom, playWallHit, playPaddleHit, playGoal, playPuckDrop]);
+
+  // Determine which score is "mine" based on player position
+  const myScore = isPlayer1 ? score.player1 : score.player2;
+  const opponentScore = isPlayer1 ? score.player2 : score.player1;
 
   return (
     <div className="fixed inset-0 flex flex-col items-center justify-center bg-black">
       {/* Scoreboard */}
-      <div className="absolute top-4 left-0 right-0 flex justify-between px-8 z-10 pointer-events-none">
-        <div className="text-4xl font-bold text-neon-pink neon-text">{score.opponent}</div>
+      <div className="absolute top-4 left-0 right-0 flex justify-between items-center px-8 z-10 pointer-events-none">
+        <div className="text-center">
+          <div className="text-4xl font-bold text-neon-pink">{score.player2}</div>
+          <div className="text-xs text-gray-400">{isPlayer1 ? 'OPPONENT' : 'YOU'}</div>
+        </div>
         {isMultiplayer && (
-          <div className="text-sm text-gray-400 self-center">ONLINE</div>
+          <div className="text-sm text-green-400 animate-pulse">● LIVE</div>
         )}
-        <div className="text-4xl font-bold text-neon-blue neon-text">{score.player}</div>
+        <div className="text-center">
+          <div className="text-4xl font-bold text-neon-blue">{score.player1}</div>
+          <div className="text-xs text-gray-400">{isPlayer1 ? 'YOU' : 'OPPONENT'}</div>
+        </div>
       </div>
 
       <div className="relative w-full h-full max-w-lg max-h-[90vh] p-4">

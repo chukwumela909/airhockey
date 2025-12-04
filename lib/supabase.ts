@@ -5,13 +5,27 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 
+// Generate a UUID using a fallback for older browsers
+function generateUUID(): string {
+  // Use crypto.randomUUID if available
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  // Fallback for older browsers
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
 // Generate or retrieve a persistent device ID for anonymous sessions
 export function getDeviceId(): string {
   if (typeof window === 'undefined') return '';
   
   let deviceId = localStorage.getItem('airhockey_device_id');
   if (!deviceId) {
-    deviceId = crypto.randomUUID();
+    deviceId = generateUUID();
     localStorage.setItem('airhockey_device_id', deviceId);
   }
   return deviceId;
@@ -43,8 +57,23 @@ export interface GameState {
   last_update: string;
 }
 
-export interface MatchmakingEntry {
+export interface OnlinePlayer {
   id: string;
-  player_id: string;
+  device_id: string;
+  nickname: string;
+  status: 'online' | 'in_game' | 'busy';
+  last_seen: string;
   created_at: string;
+}
+
+export interface ChallengeRequest {
+  id: string;
+  challenger_id: string;
+  challenger_nickname: string;
+  challenged_id: string;
+  challenged_nickname: string;
+  status: 'pending' | 'accepted' | 'declined' | 'expired';
+  room_id: string | null;
+  created_at: string;
+  expires_at: string;
 }

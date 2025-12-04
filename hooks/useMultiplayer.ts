@@ -1,211 +1,299 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { supabase, getDeviceId, GameRoom, GameState } from '@/lib/supabase';
+import { supabase, getDeviceId, OnlinePlayer, ChallengeRequest, GameRoom } from '@/lib/supabase';
 import { RealtimeChannel } from '@supabase/supabase-js';
 
 interface UseMultiplayerOptions {
-  onMatchFound: (room: GameRoom, isPlayer1: boolean) => void;
-  onOpponentJoined: (room: GameRoom) => void;
-  onGameStateUpdate: (state: GameState) => void;
+  onChallengeReceived: (challenge: ChallengeRequest) => void;
+  onChallengeAccepted: (room: GameRoom, isPlayer1: boolean) => void;
+  onChallengeDeclined: (challenge: ChallengeRequest) => void;
   onOpponentLeft: () => void;
 }
 
 export function useMultiplayer(options: UseMultiplayerOptions) {
-  const [isSearching, setIsSearching] = useState(false);
-  const [currentRoom, setCurrentRoom] = useState<GameRoom | null>(null);
   const [deviceId, setDeviceId] = useState<string>('');
+  const [nickname, setNickname] = useState<string>('');
+  const [isOnline, setIsOnline] = useState(false);
+  const [onlinePlayers, setOnlinePlayers] = useState<OnlinePlayer[]>([]);
+  const [pendingChallenge, setPendingChallenge] = useState<ChallengeRequest | null>(null);
+  const [sentChallenge, setSentChallenge] = useState<ChallengeRequest | null>(null);
+  const [currentRoom, setCurrentRoom] = useState<GameRoom | null>(null);
   const [isPlayer1, setIsPlayer1] = useState(false);
-  const channelRef = useRef<RealtimeChannel | null>(null);
-  const gameStateChannelRef = useRef<RealtimeChannel | null>(null);
+  
+  const channelsRef = useRef<RealtimeChannel[]>([]);
+  const heartbeatRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
-    setDeviceId(getDeviceId());
+    const id = getDeviceId();
+    setDeviceId(id);
+    
+    // Check if user has a saved nickname
+    const savedNickname = localStorage.getItem('airhockey_nickname');
+    if (savedNickname) {
+      setNickname(savedNickname);
+    }
   }, []);
 
-  // Cleanup on unmount or browser close
-  useEffect(() => {
-    const cleanup = async () => {
-      if (deviceId) {
-        // Remove from matchmaking queue
-        await supabase.from('matchmaking_queue').delete().eq('player_id', deviceId);
-        
-        // If in a room, handle leaving
-        if (currentRoom) {
-          if (currentRoom.status === 'waiting') {
-            // Delete the room if we created it and no one joined
-            await supabase.from('game_rooms').delete().eq('id', currentRoom.id);
-          } else {
-            // Mark room as finished if game was in progress
-            await supabase.from('game_rooms').update({ status: 'finished' }).eq('id', currentRoom.id);
-          }
-        }
-      }
-    };
-
-    window.addEventListener('beforeunload', cleanup);
-    return () => {
-      window.removeEventListener('beforeunload', cleanup);
-      cleanup();
-      channelRef.current?.unsubscribe();
-      gameStateChannelRef.current?.unsubscribe();
-    };
-  }, [deviceId, currentRoom]);
-
-  const findMatch = useCallback(async () => {
+  // Go online with nickname
+  const goOnline = useCallback(async (playerNickname: string) => {
     if (!deviceId) return;
     
-    setIsSearching(true);
+    // Save nickname
+    localStorage.setItem('airhockey_nickname', playerNickname);
+    setNickname(playerNickname);
 
-    try {
-      // First, check if there's an existing waiting room we can join
-      const { data: waitingRooms } = await supabase
-        .from('game_rooms')
-        .select('*')
-        .eq('status', 'waiting')
-        .neq('player1_id', deviceId)
-        .order('created_at', { ascending: true })
-        .limit(1);
+    // Upsert into online_players
+    const { error } = await supabase
+      .from('online_players')
+      .upsert({
+        device_id: deviceId,
+        nickname: playerNickname,
+        status: 'online',
+        last_seen: new Date().toISOString(),
+      }, {
+        onConflict: 'device_id'
+      });
 
-      if (waitingRooms && waitingRooms.length > 0) {
-        // Join existing room
-        const room = waitingRooms[0] as GameRoom;
-        
-        const { data: updatedRoom, error } = await supabase
-          .from('game_rooms')
-          .update({ 
-            player2_id: deviceId, 
-            status: 'playing',
-            updated_at: new Date().toISOString()
-          })
-          .eq('id', room.id)
-          .eq('status', 'waiting') // Ensure it's still waiting
-          .select()
-          .single();
-
-        if (updatedRoom && !error) {
-          setCurrentRoom(updatedRoom);
-          setIsPlayer1(false);
-          setIsSearching(false);
-          subscribeToRoom(updatedRoom.id);
-          options.onMatchFound(updatedRoom, false);
-          return;
-        }
-      }
-
-      // No waiting room found, create a new one
-      const { data: newRoom, error } = await supabase
-        .from('game_rooms')
-        .insert({
-          player1_id: deviceId,
-          status: 'waiting'
-        })
-        .select()
-        .single();
-
-      if (newRoom && !error) {
-        setCurrentRoom(newRoom);
-        setIsPlayer1(true);
-        subscribeToRoom(newRoom.id);
-        
-        // Initialize game state for this room
-        await supabase.from('game_state').insert({
-          room_id: newRoom.id
-        });
-      }
-    } catch (error) {
-      console.error('Error finding match:', error);
-      setIsSearching(false);
+    if (!error) {
+      setIsOnline(true);
+      startHeartbeat();
+      subscribeToUpdates();
+      fetchOnlinePlayers();
     }
+  }, [deviceId]);
+
+  // Heartbeat to keep presence alive
+  const startHeartbeat = useCallback(() => {
+    if (heartbeatRef.current) {
+      clearInterval(heartbeatRef.current);
+    }
+    
+    heartbeatRef.current = setInterval(async () => {
+      if (deviceId) {
+        await supabase
+          .from('online_players')
+          .update({ last_seen: new Date().toISOString() })
+          .eq('device_id', deviceId);
+        
+        // Also refresh the players list
+        fetchOnlinePlayers();
+      }
+    }, 5000); // Every 5 seconds
+  }, [deviceId]);
+
+  // Fetch online players
+  const fetchOnlinePlayers = useCallback(async () => {
+    const fifteenSecondsAgo = new Date(Date.now() - 15000).toISOString();
+    
+    const { data } = await supabase
+      .from('online_players')
+      .select('*')
+      .eq('status', 'online')
+      .gte('last_seen', fifteenSecondsAgo)
+      .neq('device_id', deviceId);
+
+    if (data) {
+      setOnlinePlayers(data);
+    }
+  }, [deviceId]);
+
+  // Subscribe to real-time updates
+  const subscribeToUpdates = useCallback(() => {
+    // Unsubscribe from previous channels
+    channelsRef.current.forEach(ch => ch.unsubscribe());
+    channelsRef.current = [];
+
+    // Subscribe to online players changes
+    const playersChannel = supabase
+      .channel('online_players_changes')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'online_players' },
+        () => {
+          fetchOnlinePlayers();
+        }
+      )
+      .subscribe();
+
+    // Subscribe to challenge requests for this player (incoming)
+    const incomingChallengesChannel = supabase
+      .channel(`challenges_incoming_${deviceId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'challenge_requests',
+          filter: `challenged_id=eq.${deviceId}`
+        },
+        (payload) => {
+          const challenge = payload.new as ChallengeRequest;
+          if (challenge.status === 'pending') {
+            setPendingChallenge(challenge);
+            options.onChallengeReceived(challenge);
+          }
+        }
+      )
+      .subscribe();
+
+    // Subscribe to challenge requests we sent (outgoing)
+    const outgoingChallengesChannel = supabase
+      .channel(`challenges_outgoing_${deviceId}`)
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'challenge_requests',
+          filter: `challenger_id=eq.${deviceId}`
+        },
+        async (payload) => {
+          const challenge = payload.new as ChallengeRequest;
+          if (challenge.status === 'accepted' && challenge.room_id) {
+            // Fetch the room
+            const { data: room } = await supabase
+              .from('game_rooms')
+              .select('*')
+              .eq('id', challenge.room_id)
+              .single();
+            
+            if (room) {
+              setCurrentRoom(room);
+              setIsPlayer1(true);
+              setSentChallenge(null);
+              options.onChallengeAccepted(room, true);
+            }
+          } else if (challenge.status === 'declined') {
+            setSentChallenge(null);
+            options.onChallengeDeclined(challenge);
+            
+            // Reset our status back to online
+            await supabase
+              .from('online_players')
+              .update({ status: 'online' })
+              .eq('device_id', deviceId);
+          }
+        }
+      )
+      .subscribe();
+
+    channelsRef.current = [playersChannel, incomingChallengesChannel, outgoingChallengesChannel];
+  }, [deviceId, options, fetchOnlinePlayers]);
+
+  // Send challenge to a player
+  const sendChallenge = useCallback(async (targetPlayer: OnlinePlayer) => {
+    if (!deviceId || !nickname) return null;
+
+    // Set our status to busy
+    await supabase
+      .from('online_players')
+      .update({ status: 'busy' })
+      .eq('device_id', deviceId);
+
+    const { data, error } = await supabase
+      .from('challenge_requests')
+      .insert({
+        challenger_id: deviceId,
+        challenger_nickname: nickname,
+        challenged_id: targetPlayer.device_id,
+        challenged_nickname: targetPlayer.nickname,
+        status: 'pending',
+      })
+      .select()
+      .single();
+
+    if (error) {
+      // Reset status
+      await supabase
+        .from('online_players')
+        .update({ status: 'online' })
+        .eq('device_id', deviceId);
+      return null;
+    }
+
+    setSentChallenge(data as ChallengeRequest);
+    return data as ChallengeRequest;
+  }, [deviceId, nickname]);
+
+  // Accept a challenge
+  const acceptChallenge = useCallback(async (challenge: ChallengeRequest) => {
+    if (!deviceId) return;
+
+    // Create a game room
+    const { data: room, error: roomError } = await supabase
+      .from('game_rooms')
+      .insert({
+        player1_id: challenge.challenger_id,
+        player2_id: deviceId,
+        status: 'playing',
+      })
+      .select()
+      .single();
+
+    if (roomError || !room) return;
+
+    // Create game state
+    await supabase.from('game_state').insert({
+      room_id: room.id
+    });
+
+    // Update challenge with room_id and status
+    await supabase
+      .from('challenge_requests')
+      .update({
+        status: 'accepted',
+        room_id: room.id,
+      })
+      .eq('id', challenge.id);
+
+    // Update both players to in_game
+    await supabase
+      .from('online_players')
+      .update({ status: 'in_game' })
+      .in('device_id', [challenge.challenger_id, deviceId]);
+
+    setCurrentRoom(room);
+    setIsPlayer1(false);
+    setPendingChallenge(null);
+    options.onChallengeAccepted(room, false);
   }, [deviceId, options]);
 
-  const subscribeToRoom = useCallback((roomId: string) => {
-    // Unsubscribe from previous channels
-    channelRef.current?.unsubscribe();
-    gameStateChannelRef.current?.unsubscribe();
+  // Decline a challenge
+  const declineChallenge = useCallback(async (challenge: ChallengeRequest) => {
+    await supabase
+      .from('challenge_requests')
+      .update({ status: 'declined' })
+      .eq('id', challenge.id);
 
-    // Subscribe to room changes
-    channelRef.current = supabase
-      .channel(`room:${roomId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'game_rooms',
-          filter: `id=eq.${roomId}`
-        },
-        (payload) => {
-          const updatedRoom = payload.new as GameRoom;
-          setCurrentRoom(updatedRoom);
-          
-          if (updatedRoom.status === 'playing' && updatedRoom.player2_id) {
-            setIsSearching(false);
-            options.onOpponentJoined(updatedRoom);
-          }
-          
-          if (updatedRoom.status === 'finished') {
-            options.onOpponentLeft();
-          }
-        }
-      )
-      .subscribe();
+    // Reset challenger's status
+    await supabase
+      .from('online_players')
+      .update({ status: 'online' })
+      .eq('device_id', challenge.challenger_id);
 
-    // Subscribe to game state changes
-    gameStateChannelRef.current = supabase
-      .channel(`gamestate:${roomId}`)
-      .on(
-        'postgres_changes',
-        {
-          event: 'UPDATE',
-          schema: 'public',
-          table: 'game_state',
-          filter: `room_id=eq.${roomId}`
-        },
-        (payload) => {
-          options.onGameStateUpdate(payload.new as GameState);
-        }
-      )
-      .subscribe();
-  }, [options]);
+    setPendingChallenge(null);
+  }, []);
 
-  const updateGameState = useCallback(async (state: Partial<GameState>) => {
-    if (!currentRoom) return;
+  // Cancel a sent challenge
+  const cancelChallenge = useCallback(async () => {
+    if (!sentChallenge) return;
     
     await supabase
-      .from('game_state')
-      .update({
-        ...state,
-        last_update: new Date().toISOString()
-      })
-      .eq('room_id', currentRoom.id);
-  }, [currentRoom]);
+      .from('challenge_requests')
+      .delete()
+      .eq('id', sentChallenge.id);
 
-  const updateScore = useCallback(async (player1Score: number, player2Score: number) => {
-    if (!currentRoom) return;
-    
+    // Reset our status
     await supabase
-      .from('game_rooms')
-      .update({
-        player1_score: player1Score,
-        player2_score: player2Score,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', currentRoom.id);
-  }, [currentRoom]);
-
-  const cancelSearch = useCallback(async () => {
-    if (currentRoom && currentRoom.status === 'waiting') {
-      await supabase.from('game_rooms').delete().eq('id', currentRoom.id);
-      await supabase.from('game_state').delete().eq('room_id', currentRoom.id);
-    }
+      .from('online_players')
+      .update({ status: 'online' })
+      .eq('device_id', deviceId);
     
-    channelRef.current?.unsubscribe();
-    gameStateChannelRef.current?.unsubscribe();
-    setCurrentRoom(null);
-    setIsSearching(false);
-  }, [currentRoom]);
+    setSentChallenge(null);
+  }, [sentChallenge, deviceId]);
 
+  // Leave game
   const leaveGame = useCallback(async () => {
     if (currentRoom) {
       await supabase
@@ -213,22 +301,72 @@ export function useMultiplayer(options: UseMultiplayerOptions) {
         .update({ status: 'finished' })
         .eq('id', currentRoom.id);
     }
-    
-    channelRef.current?.unsubscribe();
-    gameStateChannelRef.current?.unsubscribe();
+
+    // Go back online
+    await supabase
+      .from('online_players')
+      .update({ status: 'online' })
+      .eq('device_id', deviceId);
+
     setCurrentRoom(null);
-    setIsSearching(false);
-  }, [currentRoom]);
+  }, [currentRoom, deviceId]);
+
+  // Go offline
+  const goOffline = useCallback(async () => {
+    if (heartbeatRef.current) {
+      clearInterval(heartbeatRef.current);
+    }
+    
+    channelsRef.current.forEach(ch => ch.unsubscribe());
+    
+    await supabase
+      .from('online_players')
+      .delete()
+      .eq('device_id', deviceId);
+
+    setIsOnline(false);
+    setOnlinePlayers([]);
+  }, [deviceId]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    const cleanup = async () => {
+      if (heartbeatRef.current) {
+        clearInterval(heartbeatRef.current);
+      }
+      channelsRef.current.forEach(ch => ch.unsubscribe());
+      
+      if (deviceId) {
+        await supabase
+          .from('online_players')
+          .delete()
+          .eq('device_id', deviceId);
+      }
+    };
+
+    window.addEventListener('beforeunload', cleanup);
+    return () => {
+      window.removeEventListener('beforeunload', cleanup);
+      cleanup();
+    };
+  }, [deviceId]);
 
   return {
-    isSearching,
+    deviceId,
+    nickname,
+    isOnline,
+    onlinePlayers,
+    pendingChallenge,
+    sentChallenge,
     currentRoom,
     isPlayer1,
-    deviceId,
-    findMatch,
-    cancelSearch,
+    goOnline,
+    goOffline,
+    sendChallenge,
+    acceptChallenge,
+    declineChallenge,
+    cancelChallenge,
     leaveGame,
-    updateGameState,
-    updateScore,
+    refreshPlayers: fetchOnlinePlayers,
   };
 }
