@@ -28,6 +28,7 @@ export default function GameTable({
   const PUCK_RADIUS = 15;
   const PADDLE_RADIUS = 25;
   const GOAL_SIZE = 120;
+  const WIN_SCORE = 7;
 
   // Refs to hold mutable game state
   const gameStateRef = useRef({
@@ -264,7 +265,12 @@ export default function GameTable({
       }
 
       const x = (clientX - rect.left) * scaleX;
-      const y = (clientY - rect.top) * scaleY;
+      let y = (clientY - rect.top) * scaleY;
+
+      // Flip input vertically for Player 2 so their bottom touch maps to their own goal line
+      if (!isPlayer1Ref.current) {
+        y = TABLE_HEIGHT - y;
+      }
 
       // Constrain to own half
       const constrainedX = Math.max(PADDLE_RADIUS, Math.min(TABLE_WIDTH - PADDLE_RADIUS, x));
@@ -342,6 +348,15 @@ export default function GameTable({
             playGoal();
             broadcastSound('goal');
             spawnParticles(gameState.puck.x, gameState.puck.y, '#FFD700', 30);
+
+            // Win condition
+            if (newScore.player1 >= WIN_SCORE) {
+              gameState.puck.vx = 0;
+              gameState.puck.vy = 0;
+              setTimeout(() => onEndGame(), 600);
+              return;
+            }
+
             resetPuck();
           } else {
             gameState.puck.y = PUCK_RADIUS;
@@ -363,6 +378,15 @@ export default function GameTable({
             playGoal();
             broadcastSound('goal');
             spawnParticles(gameState.puck.x, gameState.puck.y, '#FFD700', 30);
+
+            // Win condition
+            if (newScore.player2 >= WIN_SCORE) {
+              gameState.puck.vx = 0;
+              gameState.puck.vy = 0;
+              setTimeout(() => onEndGame(), 600);
+              return;
+            }
+
             resetPuck();
           } else {
             gameState.puck.y = TABLE_HEIGHT - PUCK_RADIUS;
@@ -453,6 +477,13 @@ export default function GameTable({
     };
 
     const draw = () => {
+      ctx.save();
+      // Flip the view for Player 2 so they see from their own goal line
+      if (!isPlayer1Ref.current) {
+        ctx.translate(0, TABLE_HEIGHT);
+        ctx.scale(1, -1);
+      }
+
       // Clear
       ctx.fillStyle = '#1a1a2e';
       ctx.fillRect(0, 0, TABLE_WIDTH, TABLE_HEIGHT);
@@ -573,6 +604,8 @@ export default function GameTable({
 
       // Draw particles
       drawParticles();
+
+      ctx.restore();
     };
 
     update();
